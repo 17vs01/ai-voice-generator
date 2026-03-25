@@ -1,0 +1,16 @@
+# API 키 절대 올리면 안 돼요!
+.env
+
+# 생성된 파일들
+favorites.json
+history.json
+*.mp3
+
+# Python 캐시
+__pycache__/
+*.pyc
+.cache/
+
+# 가상환경
+.venv/
+venv/
