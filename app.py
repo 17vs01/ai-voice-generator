@@ -199,16 +199,15 @@ with main_tab1:
     st.divider()
     st.subheader("2️⃣ 텍스트 입력")
 
-    # 기록/AI결과에서 가져온 텍스트 자동 채우기
-    if "reuse_text" in st.session_state:
-        st.session_state["main_text"] = st.session_state.pop("reuse_text")
+    # AI결과/기록에서 가져온 텍스트 처리
+    preset_text = st.session_state.pop("reuse_text", "")
 
     text_input = st.text_area(
         "읽어줄 텍스트를 입력하세요",
+        value=preset_text,
         placeholder="예) 안녕하세요! AI 음성 생성기 테스트 중이에요.",
         height=150,
         max_chars=2500,
-        key="main_text",
     )
     st.caption(f"글자 수: {len(text_input)} / 2500")
 
@@ -220,7 +219,7 @@ with main_tab1:
                 with st.spinner("AI가 텍스트를 다듬고 있어요..."):
                     try:
                         refined = refine_text_with_ai(text_input, "refine")
-                        st.session_state["main_text"] = refined
+                        st.session_state["reuse_text"] = refined
                         st.rerun()
                     except Exception as e:
                         st.error(str(e))
@@ -230,7 +229,7 @@ with main_tab1:
                 with st.spinner("AI가 요약하고 있어요..."):
                     try:
                         summarized = refine_text_with_ai(text_input, "summarize")
-                        st.session_state["main_text"] = summarized
+                        st.session_state["reuse_text"] = summarized
                         st.rerun()
                     except Exception as e:
                         st.error(str(e))
@@ -240,7 +239,7 @@ with main_tab1:
                 with st.spinner("AI가 번역하고 있어요..."):
                     try:
                         translated = refine_text_with_ai(text_input, "translate_ko")
-                        st.session_state["main_text"] = translated
+                        st.session_state["reuse_text"] = translated
                         st.rerun()
                     except Exception as e:
                         st.error(str(e))
