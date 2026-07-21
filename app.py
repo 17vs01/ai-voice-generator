@@ -1,11 +1,13 @@
 """
-app.py  –  AI 음성 생성기 v3.0
-실행: py -3.11 -m streamlit run app.py
+app.py  –  AI 음성 생성기 v4.0
+실행: streamlit run app.py
+
+즐겨찾기·생성 기록은 브라우저 세션별로 따로 보관돼요 (사용자끼리 섞이지 않음).
 """
 
-import json
+import io
+import zipfile
 from datetime import datetime
-from pathlib import Path
 
 import streamlit as st
 from tts_service import (
@@ -14,66 +16,11 @@ from tts_service import (
     speech_to_text,
     refine_text_with_ai,
     adjust_audio,
+    get_elevenlabs_usage,
+    MAX_CHARS,
 )
 
-# ── 파일 경로 ────────────────────────────────────────────────
-FAV_FILE  = Path("favorites.json")
-HIST_FILE = Path("history.json")
-
-
-# ════════════════════════════════════════════════════════════
-# JSON 유틸
-# ════════════════════════════════════════════════════════════
-def _load(path: Path) -> list:
-    try:
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
-    except Exception:
-        return []
-
-def _save(path: Path, data: list) -> None:
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-# ════════════════════════════════════════════════════════════
-# 즐겨찾기 헬퍼
-# ════════════════════════════════════════════════════════════
-def load_favorites() -> list[str]:
-    return _load(FAV_FILE)
-
-def save_favorites(favs: list[str]) -> None:
-    _save(FAV_FILE, favs)
-
-def toggle_favorite(voice_id: str) -> None:
-    favs = load_favorites()
-    if voice_id in favs:
-        favs.remove(voice_id)
-    else:
-        favs.append(voice_id)
-    save_favorites(favs)
-
-
-# ════════════════════════════════════════════════════════════
-# 히스토리 헬퍼
-# ════════════════════════════════════════════════════════════
-def load_history() -> list[dict]:
-    return _load(HIST_FILE)
-
-def add_history(voice_name: str, text: str, service: str, audio: bytes) -> None:
-    hist = load_history()
-    hist.insert(0, {
-        "time":    datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "voice":   voice_name,
-        "text":    text[:80] + ("…" if len(text) > 80 else ""),
-        "full_text": text,
-        "service": service,
-        "audio":   list(audio),
-    })
-    _save(HIST_FILE, hist[:30])
-
-
-# ════════════════════════════════════════════════════════════
-# 페이지 설정
-# ════════════════════════════════════════════════════════════
+# ── 페이지 설정 (반드시 첫 Streamlit 명령) ───────────────────
 st.set_page_config(page_title="AI 음성 생성기", page_icon="🎙️", layout="wide")
 
 st.markdown("""
@@ -81,23 +28,65 @@ st.markdown("""
     .stApp { background: #f8f9fc; }
     section[data-testid="stSidebar"] { background: #1e1b4b; }
     section[data-testid="stSidebar"] * { color: white !important; }
-    .provider-badge {
-        display: inline-block;
-        padding: 2px 10px;
-        border-radius: 99px;
-        font-size: 0.75rem;
-        font-weight: 600;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ════════════════════════════════════════════════════════════
-# 목소리 목록 로드 (캐시 1시간)
+# 세션 상태 기반 저장 (사용자/세션별로 분리 → 서로 안 섞임)
+# ════════════════════════════════════════════════════════════
+def load_favorites() -> list:
+    return st.session_state.setdefault("favorites", [])
+
+def toggle_favorite(voice_id: str) -> None:
+    favs = load_favorites()
+    if voice_id in favs:
+        favs.remove(voice_id)
+    else:
+        favs.append(voice_id)
+
+def load_history() -> list:
+    return st.session_state.setdefault("history", [])
+
+def add_history(voice_name: str, text: str, service: str, audio: bytes) -> None:
+    hist = load_history()
+    hist.insert(0, {
+        "time":      datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "voice":     voice_name,
+        "text":      text[:80] + ("…" if len(text) > 80 else ""),
+        "full_text": text,
+        "service":   service,
+        "audio":     audio,          # 실제 bytes 그대로 (정수 배열 X)
+    })
+    del hist[30:]                    # 최근 30개만 유지
+
+
+# ════════════════════════════════════════════════════════════
+# 대기 중인 프로그램적 상태 변경을 위젯 생성 '전에' 반영
+#   (Streamlit 은 위젯 생성 후 그 key 를 바꿀 수 없어서 최상단에서 처리)
+# ════════════════════════════════════════════════════════════
+if "_goto" in st.session_state:
+    st.session_state["nav"] = st.session_state.pop("_goto")
+if "_pending_text" in st.session_state:
+    st.session_state["text_key"] = st.session_state.pop("_pending_text")
+if "_pending_stt" in st.session_state:
+    st.session_state["stt_key"] = st.session_state.pop("_pending_stt")
+
+
+SVC_LABELS = {"elevenlabs": "🟢 ElevenLabs", "openai": "🔵 OpenAI", "gtts": "🟡 Google TTS"}
+LANGS = {"한국어": "ko", "English": "en", "日本語": "ja", "中文": "zh", "Español": "es", "Français": "fr"}
+
+
+# ════════════════════════════════════════════════════════════
+# 목소리 목록 / 사용량 로드 (캐시)
 # ════════════════════════════════════════════════════════════
 @st.cache_data(ttl=3600)
 def load_voices():
     return get_voices()
+
+@st.cache_data(ttl=300)
+def load_usage():
+    return get_elevenlabs_usage()
 
 try:
     all_voices = load_voices()
@@ -109,7 +98,7 @@ voice_by_id = {v["voice_id"]: v for v in all_voices}
 
 
 # ════════════════════════════════════════════════════════════
-# 사이드바 – 즐겨찾기
+# 사이드바
 # ════════════════════════════════════════════════════════════
 with st.sidebar:
     st.title("⭐ 즐겨찾기")
@@ -124,158 +113,169 @@ with st.sidebar:
                 toggle_favorite(fv["voice_id"])
                 st.rerun()
     else:
-        st.caption("아직 즐겨찾기가 없어요!\n목소리 옆 ⭐ 버튼을 눌러보세요.")
+        st.caption("아직 즐겨찾기가 없어요!\n목소리 아래 ☆ 버튼을 눌러보세요.")
 
     st.divider()
-    total = len(all_voices)
+    st.subheader("🌐 언어")
+    lang_name = st.selectbox("음성→텍스트 / Google TTS 언어", list(LANGS.keys()), key="lang_name")
+    lang_code = LANGS[lang_name]
+
+    st.divider()
+    total  = len(all_voices)
     female = sum(1 for v in all_voices if v["gender"] == "female")
     male   = sum(1 for v in all_voices if v["gender"] == "male")
     st.caption(f"🎙️ 전체 목소리: {total}개")
     st.caption(f"👩 여성: {female}개  |  👨 남성: {male}개")
+
+    usage = load_usage()
+    if usage and usage.get("limit"):
+        used, limit = usage["used"], usage["limit"]
+        st.divider()
+        st.caption("🟢 ElevenLabs 사용량")
+        st.progress(min(used / limit, 1.0))
+        st.caption(f"{used:,} / {limit:,} 자 ({limit - used:,}자 남음)")
+
     st.divider()
-    st.caption("AI 음성 생성기 v3.0")
+    st.caption("AI 음성 생성기 v4.0")
 
 
 # ════════════════════════════════════════════════════════════
-# 메인 화면 – 탭 구성
+# 제목 + 상단 네비게이션 (라디오 → 탭 전환 시에도 rerun 발생)
 # ════════════════════════════════════════════════════════════
 st.title("🎙️ AI 음성 생성기")
-st.caption("텍스트 입력 또는 MP3 업로드로 다양한 목소리를 만들어보세요!")
+st.caption("텍스트·MP3·일괄 생성으로 다양한 목소리를 만들어보세요!")
+
+NAV = ["✍️ 텍스트로 생성", "🎵 MP3로 변환", "📦 일괄 생성", "📝 생성 기록"]
+nav = st.radio("모드", NAV, horizontal=True, key="nav", label_visibility="collapsed")
 st.divider()
 
-main_tab1, main_tab2, main_tab3 = st.tabs(["✍️ 텍스트로 생성", "🎵 MP3로 변환", "📝 생성 기록"])
-
 
 # ════════════════════════════════════════════════════════════
-# 공통: 목소리 선택 위젯
+# 공통: 목소리 선택 위젯 (라디오 필터 + 단일 셀렉트박스 + 미리듣기)
+#   → 화면에 보이는 선택이 곧 실제 선택 (탭 방식의 오작동 해결)
 # ════════════════════════════════════════════════════════════
-def voice_selector_widget(key_prefix: str) -> tuple[str, str]:
-    """목소리 선택 탭 + 즐겨찾기 버튼. (voice_id, display_name) 반환"""
+def _preview_text(voice_id: str) -> str:
+    if voice_id == "gtts_en":
+        return "Hello! This is a quick voice preview."
+    if voice_id == "gtts_ja":
+        return "こんにちは。これは声のプレビューです。"
+    return "안녕하세요, 만나서 반가워요. 목소리 미리듣기입니다."
 
-    tab_all, tab_female, tab_male, tab_fav = st.tabs(
-        ["전체 🎙️", "여성 👩", "남성 👨", "즐겨찾기 ⭐"]
+def voice_selector_widget(key_prefix: str):
+    """(voice_id, display_name) 반환. 하나만 선택되므로 결과가 명확해요."""
+    filt = st.radio(
+        "목소리 종류",
+        ["전체 🎙️", "여성 👩", "남성 👨", "즐겨찾기 ⭐"],
+        horizontal=True, key=f"filt_{key_prefix}",
     )
 
-    selected_id   = None
-    selected_name = None
+    if filt == "여성 👩":
+        pool = [v for v in all_voices if v["gender"] == "female"]
+    elif filt == "남성 👨":
+        pool = [v for v in all_voices if v["gender"] == "male"]
+    elif filt == "즐겨찾기 ⭐":
+        pool = [voice_by_id[i] for i in load_favorites() if i in voice_by_id]
+    else:
+        pool = all_voices
 
-    def _select(voices, prefix):
-        nonlocal selected_id, selected_name
-        if not voices:
-            st.info("해당하는 목소리가 없어요.")
-            return
-        opts = {v["display_name"]: v for v in voices}
-        picked_name = st.selectbox("목소리를 골라주세요", list(opts.keys()), key=f"sel_{prefix}")
-        picked = opts[picked_name]
-        selected_id   = picked["voice_id"]
-        selected_name = picked["display_name"]
+    if not pool:
+        st.info("해당하는 목소리가 없어요. 다른 탭에서 ☆ 버튼으로 즐겨찾기를 추가해보세요.")
+        return None, None
 
-        is_fav = picked["voice_id"] in load_favorites()
-        label  = "⭐ 즐겨찾기 해제" if is_fav else "☆ 즐겨찾기 추가"
-        if st.button(label, key=f"fav_btn_{prefix}"):
-            toggle_favorite(picked["voice_id"])
-            st.rerun()
+    opts = {v["display_name"]: v for v in pool}
+    picked_name = st.selectbox("목소리를 골라주세요", list(opts.keys()), key=f"sel_{key_prefix}")
+    picked = opts[picked_name]
+    vid = picked["voice_id"]
 
-    with tab_all:
-        _select(all_voices, f"{key_prefix}_all")
-    with tab_female:
-        _select([v for v in all_voices if v["gender"] == "female"], f"{key_prefix}_f")
-    with tab_male:
-        _select([v for v in all_voices if v["gender"] == "male"], f"{key_prefix}_m")
-    with tab_fav:
-        fav_list = [voice_by_id[fid] for fid in load_favorites() if fid in voice_by_id]
-        _select(fav_list, f"{key_prefix}_fav")
+    c1, c2 = st.columns(2)
+    is_fav = vid in load_favorites()
+    if c1.button("⭐ 즐겨찾기 해제" if is_fav else "☆ 즐겨찾기 추가",
+                 key=f"fav_{key_prefix}", use_container_width=True):
+        toggle_favorite(vid)
+        st.rerun()
+    if c2.button("🔊 미리듣기", key=f"prev_{key_prefix}", use_container_width=True):
+        cache = st.session_state.setdefault("preview_audio", {})
+        if vid not in cache:
+            with st.spinner("미리듣기 생성 중..."):
+                try:
+                    audio, _ = text_to_speech(_preview_text(vid), vid)
+                    cache[vid] = audio
+                except Exception as e:
+                    st.error(str(e))
 
-    return selected_id, selected_name
+    pv = st.session_state.get("preview_audio", {}).get(vid)
+    if pv:
+        st.audio(pv, format="audio/mp3")
+
+    return vid, picked["display_name"]
+
+
+def speed_pitch_widget(key_prefix: str):
+    col_sp, col_pt = st.columns(2)
+    with col_sp:
+        speed = st.slider("🐇 속도", 0.5, 2.0, 1.0, 0.1, key=f"speed_{key_prefix}",
+                          help="1.0 = 기본 / 음정은 유지돼요")
+        st.caption(f"현재: **{speed}x**")
+    with col_pt:
+        pitch = st.slider("🎵 피치(반음)", -12, 12, 0, 1, key=f"pitch_{key_prefix}",
+                          help="0 = 기본 / 음수 = 낮게 / 양수 = 높게 (속도는 유지돼요)")
+        label = "기본 ✅" if pitch == 0 else (f"+{pitch} 높음 🔼" if pitch > 0 else f"{pitch} 낮음 🔽")
+        st.caption(f"현재: **{label}**")
+    return speed, pitch
+
+
+def result_player(audio: bytes, voice_name: str, service: str, file_name: str, dl_key: str):
+    c1, c2 = st.columns([3, 1])
+    c1.caption(f"목소리: **{voice_name}**")
+    c2.caption(SVC_LABELS.get(service, service))
+    st.audio(audio, format="audio/mp3")
+    st.download_button("⬇️ MP3 다운로드", data=audio, file_name=file_name,
+                       mime="audio/mpeg", use_container_width=True, key=dl_key)
 
 
 # ════════════════════════════════════════════════════════════
-# 탭 1: 텍스트로 생성
+# 섹션 1: 텍스트로 생성
 # ════════════════════════════════════════════════════════════
-with main_tab1:
+if nav == NAV[0]:
     st.subheader("1️⃣ 목소리 선택")
     v_id, v_name = voice_selector_widget("t")
 
     st.divider()
     st.subheader("2️⃣ 텍스트 입력")
-
-    # AI결과/기록에서 가져온 텍스트 처리
-    preset_text = st.session_state.pop("reuse_text", "")
-
     text_input = st.text_area(
         "읽어줄 텍스트를 입력하세요",
-        value=preset_text,
         placeholder="예) 안녕하세요! AI 음성 생성기 테스트 중이에요.",
-        height=150,
-        max_chars=2500,
+        height=150, max_chars=MAX_CHARS, key="text_key",
     )
-    st.caption(f"글자 수: {len(text_input)} / 2500")
+    st.caption(f"글자 수: {len(text_input)} / {MAX_CHARS}  ·  긴 글은 자동으로 나눠서 이어붙여요")
 
-    # AI 다듬기 버튼
     col_r, col_s, col_t = st.columns(3)
-    with col_r:
-        if st.button("✏️ AI 교정", use_container_width=True, help="맞춤법/문장 다듬기"):
-            if text_input.strip():
-                with st.spinner("AI가 텍스트를 다듬고 있어요..."):
-                    try:
-                        refined = refine_text_with_ai(text_input, "refine")
-                        st.session_state["reuse_text"] = refined
-                        st.rerun()
-                    except Exception as e:
-                        st.error(str(e))
-    with col_s:
-        if st.button("📝 AI 요약", use_container_width=True, help="3문장 이내로 요약"):
-            if text_input.strip():
-                with st.spinner("AI가 요약하고 있어요..."):
-                    try:
-                        summarized = refine_text_with_ai(text_input, "summarize")
-                        st.session_state["reuse_text"] = summarized
-                        st.rerun()
-                    except Exception as e:
-                        st.error(str(e))
-    with col_t:
-        if st.button("🌏 한국어 번역", use_container_width=True, help="한국어로 번역"):
-            if text_input.strip():
-                with st.spinner("AI가 번역하고 있어요..."):
-                    try:
-                        translated = refine_text_with_ai(text_input, "translate_ko")
-                        st.session_state["reuse_text"] = translated
-                        st.rerun()
-                    except Exception as e:
-                        st.error(str(e))
+    ai_actions = [
+        (col_r, "✏️ AI 교정", "refine", "맞춤법/문장 다듬기"),
+        (col_s, "📝 AI 요약", "summarize", "3문장 이내로 요약"),
+        (col_t, "🌏 한국어 번역", "translate_ko", "한국어로 번역"),
+    ]
+    for col, label, mode, help_txt in ai_actions:
+        with col:
+            if st.button(label, use_container_width=True, help=help_txt, key=f"ai_{mode}"):
+                if text_input.strip():
+                    with st.spinner("AI 처리 중..."):
+                        try:
+                            st.session_state["_pending_text"] = refine_text_with_ai(text_input, mode)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
+                else:
+                    st.warning("⚠️ 먼저 텍스트를 입력해주세요!")
 
     st.divider()
-    st.subheader("3️⃣ 속도 / 피치 조절")
-
-    col_sp, col_pt = st.columns(2)
-    with col_sp:
-        speed = st.slider(
-            "🐇 속도",
-            min_value=0.5, max_value=2.0, value=1.0, step=0.1,
-            help="1.0 = 기본 속도 / 낮을수록 느리고 높을수록 빨라요",
-            key="speed_t",
-        )
-        speed_label = {0.5: "매우 느림 🐢", 0.75: "느림", 1.0: "기본 ✅", 1.25: "빠름", 1.5: "매우 빠름 🐇", 2.0: "초고속 ⚡"}.get(speed, f"{speed}x")
-        st.caption(f"현재: **{speed}x** {speed_label}")
-
-    with col_pt:
-        pitch = st.slider(
-            "🎵 피치",
-            min_value=-12, max_value=12, value=0, step=1,
-            help="0 = 기본 / 음수 = 낮은 목소리 / 양수 = 높은 목소리",
-            key="pitch_t",
-        )
-        if pitch == 0:
-            pitch_label = "기본 ✅"
-        elif pitch > 0:
-            pitch_label = f"+{pitch} 반음 (높음 🔼)"
-        else:
-            pitch_label = f"{pitch} 반음 (낮음 🔽)"
-        st.caption(f"현재: **{pitch_label}**")
+    st.subheader("3️⃣ 속도 / 피치 / 쉼")
+    speed, pitch = speed_pitch_widget("t")
+    pause_sec = st.slider("⏸️ 문단(빈 줄) 사이 쉼", 0.0, 2.0, 0.0, 0.1,
+                          help="빈 줄로 나눈 문단 사이에 무음을 넣어요", key="pause_t")
 
     st.divider()
     st.subheader("4️⃣ 음성 생성")
-
     if st.button("🎵 음성 만들기", type="primary", use_container_width=True, key="gen_text"):
         if not text_input.strip():
             st.warning("⚠️ 텍스트를 먼저 입력해주세요!")
@@ -284,127 +284,86 @@ with main_tab1:
         else:
             with st.spinner("🎙️ 음성을 만들고 있어요..."):
                 try:
-                    audio, service = text_to_speech(text_input, v_id)
-                    # 속도/피치 후처리
+                    audio, service = text_to_speech(text_input, v_id, pause_ms=int(pause_sec * 1000))
                     audio = adjust_audio(audio, speed=speed, pitch=pitch)
                     st.session_state.update({
-                        "audio_data": audio, "audio_text": text_input,
-                        "audio_voice": v_name, "audio_service": service,
+                        "audio_data": audio, "audio_voice": v_name, "audio_service": service,
                     })
                     add_history(v_name, text_input, service, audio)
-                    if service == "gtts":
-                        st.warning("⚠️ ElevenLabs 한도 초과! Google TTS로 자동 전환됐어요.")
+                    if service == "gtts" and not v_id.startswith("gtts_"):
+                        st.warning("⚠️ 유료 엔진 한도 초과! Google TTS로 자동 전환됐어요.")
                     else:
                         st.success("✅ 음성 완성!")
                 except Exception as e:
                     st.error(str(e))
 
-    # 결과 재생
     if "audio_data" in st.session_state:
         st.divider()
         st.subheader("5️⃣ 듣기 & 다운로드")
-        svc = st.session_state["audio_service"]
-        svc_label = {"elevenlabs": "🟢 ElevenLabs", "openai": "🔵 OpenAI", "gtts": "🟡 Google TTS"}.get(svc, svc)
-        c1, c2 = st.columns([3, 1])
-        c1.caption(f"목소리: **{st.session_state['audio_voice']}**")
-        c2.caption(svc_label)
-        st.audio(st.session_state["audio_data"], format="audio/mp3")
-        st.download_button("⬇️ MP3 다운로드", data=st.session_state["audio_data"],
-                           file_name="generated_voice.mp3", mime="audio/mpeg",
-                           use_container_width=True)
+        result_player(st.session_state["audio_data"], st.session_state["audio_voice"],
+                      st.session_state["audio_service"], "generated_voice.mp3", "dl_text")
 
 
 # ════════════════════════════════════════════════════════════
-# 탭 2: MP3로 변환
+# 섹션 2: MP3로 변환
 # ════════════════════════════════════════════════════════════
-with main_tab2:
-    st.subheader("🎵 MP3 파일 업로드")
-    st.caption("MP3를 올리면 AI가 텍스트로 변환하고, 원하는 목소리로 다시 만들어줘요!")
+elif nav == NAV[1]:
+    st.subheader("🎵 오디오 파일 업로드")
+    st.caption("MP3/WAV/M4A를 올리면 텍스트로 변환하고, 원하는 목소리로 다시 만들어줘요!")
 
-    uploaded = st.file_uploader("MP3 파일을 올려주세요", type=["mp3", "wav", "m4a"])
+    uploaded = st.file_uploader("파일을 올려주세요", type=["mp3", "wav", "m4a"])
 
     if uploaded:
-        st.audio(uploaded, format="audio/mp3")
-        audio_bytes = uploaded.read()
+        audio_bytes = uploaded.getvalue()          # getvalue → 포인터 문제 없이 안전
+        st.audio(audio_bytes, format="audio/mp3")
 
-        # ── STT ──
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button("🔤 텍스트로 변환 (STT)", use_container_width=True):
-                with st.spinner("AI가 음성을 텍스트로 변환하고 있어요..."):
-                    try:
-                        extracted = speech_to_text(audio_bytes)
-                        st.session_state["stt_text"] = extracted
-                        st.success("✅ 변환 완료!")
-                    except Exception as e:
-                        st.error(str(e))
+        if st.button("🔤 텍스트로 변환 (STT)", use_container_width=True, key="stt_go"):
+            with st.spinner("AI가 음성을 텍스트로 변환하고 있어요..."):
+                try:
+                    extracted, srt = speech_to_text(audio_bytes, language=lang_code)
+                    st.session_state["_pending_stt"] = extracted
+                    st.session_state["stt_srt"] = srt
+                    st.session_state["stt_ready"] = True
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
 
-        # STT 결과 표시 + AI 다듬기
-        if "stt_text" in st.session_state:
+        if st.session_state.get("stt_ready"):
             st.divider()
             st.subheader("📄 변환된 텍스트")
-            stt_text = st.text_area("텍스트를 수정할 수 있어요!", value=st.session_state["stt_text"],
-                                    height=150, key="stt_edit")
+            stt_text = st.text_area("텍스트를 수정할 수 있어요!", height=150, key="stt_key")
+
+            # 자막(SRT) 다운로드
+            if st.session_state.get("stt_srt"):
+                st.download_button("💬 자막(SRT) 다운로드", data=st.session_state["stt_srt"],
+                                   file_name="subtitle.srt", mime="text/plain", key="dl_srt")
 
             col_r2, col_s2, col_t2 = st.columns(3)
-            with col_r2:
-                if st.button("✏️ AI 교정", use_container_width=True, key="stt_refine"):
-                    with st.spinner("AI가 교정하고 있어요..."):
-                        try:
-                            refined = refine_text_with_ai(stt_text, "refine")
-                            st.session_state["stt_text"] = refined
-                            st.rerun()
-                        except Exception as e:
-                            st.error(str(e))
-            with col_s2:
-                if st.button("📝 AI 요약", use_container_width=True, key="stt_sum"):
-                    with st.spinner("AI가 요약하고 있어요..."):
-                        try:
-                            summarized = refine_text_with_ai(stt_text, "summarize")
-                            st.session_state["stt_text"] = summarized
-                            st.rerun()
-                        except Exception as e:
-                            st.error(str(e))
-            with col_t2:
-                if st.button("🌏 한국어 번역", use_container_width=True, key="stt_trans"):
-                    with st.spinner("AI가 번역하고 있어요..."):
-                        try:
-                            translated = refine_text_with_ai(stt_text, "translate_ko")
-                            st.session_state["stt_text"] = translated
-                            st.rerun()
-                        except Exception as e:
-                            st.error(str(e))
+            stt_actions = [
+                (col_r2, "✏️ AI 교정", "refine"),
+                (col_s2, "📝 AI 요약", "summarize"),
+                (col_t2, "🌏 한국어 번역", "translate_ko"),
+            ]
+            for col, label, mode in stt_actions:
+                with col:
+                    if st.button(label, use_container_width=True, key=f"stt_{mode}"):
+                        if stt_text.strip():
+                            with st.spinner("AI 처리 중..."):
+                                try:
+                                    st.session_state["_pending_stt"] = refine_text_with_ai(stt_text, mode)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(str(e))
+                        else:
+                            st.warning("⚠️ 텍스트가 비어 있어요!")
 
             st.divider()
             st.subheader("🎙️ 새 목소리 선택")
             v_id2, v_name2 = voice_selector_widget("mp3")
 
             st.divider()
-            st.subheader("🎚️ 속도 / 피치 조절")
-            col_sp2, col_pt2 = st.columns(2)
-            with col_sp2:
-                speed2 = st.slider(
-                    "🐇 속도",
-                    min_value=0.5, max_value=2.0, value=1.0, step=0.1,
-                    help="1.0 = 기본 속도",
-                    key="speed_mp3",
-                )
-                speed_label2 = {0.5: "매우 느림 🐢", 1.0: "기본 ✅", 2.0: "초고속 ⚡"}.get(speed2, f"{speed2}x")
-                st.caption(f"현재: **{speed2}x** {speed_label2}")
-            with col_pt2:
-                pitch2 = st.slider(
-                    "🎵 피치",
-                    min_value=-12, max_value=12, value=0, step=1,
-                    help="0 = 기본 / 음수 = 낮음 / 양수 = 높음",
-                    key="pitch_mp3",
-                )
-                if pitch2 == 0:
-                    pitch_label2 = "기본 ✅"
-                elif pitch2 > 0:
-                    pitch_label2 = f"+{pitch2} 반음 (높음 🔼)"
-                else:
-                    pitch_label2 = f"{pitch2} 반음 (낮음 🔽)"
-                st.caption(f"현재: **{pitch_label2}**")
+            st.subheader("🎚️ 속도 / 피치")
+            speed2, pitch2 = speed_pitch_widget("mp3")
 
             if st.button("🎵 새 목소리로 생성!", type="primary", use_container_width=True, key="gen_mp3"):
                 if not stt_text.strip():
@@ -415,7 +374,6 @@ with main_tab2:
                     with st.spinner("🎙️ 새 목소리로 생성 중..."):
                         try:
                             audio, service = text_to_speech(stt_text, v_id2)
-                            # 속도/피치 후처리
                             audio = adjust_audio(audio, speed=speed2, pitch=pitch2)
                             st.session_state.update({
                                 "mp3_audio": audio, "mp3_service": service, "mp3_voice": v_name2,
@@ -427,21 +385,79 @@ with main_tab2:
 
             if "mp3_audio" in st.session_state:
                 st.divider()
-                svc = st.session_state["mp3_service"]
-                svc_label = {"elevenlabs": "🟢 ElevenLabs", "openai": "🔵 OpenAI", "gtts": "🟡 Google TTS"}.get(svc, svc)
-                c1, c2 = st.columns([3, 1])
-                c1.caption(f"목소리: **{st.session_state['mp3_voice']}**")
-                c2.caption(svc_label)
-                st.audio(st.session_state["mp3_audio"], format="audio/mp3")
-                st.download_button("⬇️ MP3 다운로드", data=st.session_state["mp3_audio"],
-                                   file_name="converted_voice.mp3", mime="audio/mpeg",
-                                   use_container_width=True, key="dl_mp3")
+                result_player(st.session_state["mp3_audio"], st.session_state["mp3_voice"],
+                              st.session_state["mp3_service"], "converted_voice.mp3", "dl_mp3")
 
 
 # ════════════════════════════════════════════════════════════
-# 탭 3: 생성 기록
+# 섹션 3: 일괄 생성 (여러 문장 → 여러 MP3 → ZIP)
 # ════════════════════════════════════════════════════════════
-with main_tab3:
+elif nav == NAV[2]:
+    st.subheader("📦 일괄 생성")
+    st.caption("한 줄에 하나씩 입력하면 각각 음성으로 만들어 ZIP으로 받을 수 있어요. (최대 20줄)")
+
+    st.subheader("1️⃣ 목소리 선택")
+    vb_id, vb_name = voice_selector_widget("b")
+
+    st.divider()
+    st.subheader("2️⃣ 문장 입력 (한 줄 = 하나)")
+    batch_text = st.text_area("여러 줄 입력", height=200, key="batch_key",
+                              placeholder="첫 번째 문장\n두 번째 문장\n세 번째 문장")
+    lines = [l.strip() for l in batch_text.splitlines() if l.strip()]
+    st.caption(f"입력된 문장: {len(lines)}개")
+
+    st.divider()
+    st.subheader("3️⃣ 속도 / 피치")
+    speed3, pitch3 = speed_pitch_widget("b")
+
+    st.divider()
+    if st.button("📦 일괄 생성 시작", type="primary", use_container_width=True, key="gen_batch"):
+        if not lines:
+            st.warning("⚠️ 문장을 입력해주세요!")
+        elif not vb_id:
+            st.warning("⚠️ 목소리를 선택해주세요!")
+        elif len(lines) > 20:
+            st.warning("⚠️ 한 번에 최대 20줄까지만 가능해요!")
+        else:
+            results = []
+            progress = st.progress(0.0)
+            errors = []
+            for i, line in enumerate(lines):
+                try:
+                    audio, service = text_to_speech(line, vb_id)
+                    audio = adjust_audio(audio, speed=speed3, pitch=pitch3)
+                    results.append({"text": line, "audio": audio, "service": service})
+                    add_history(vb_name, line, service, audio)
+                except Exception as e:
+                    errors.append(f"{i+1}번째 줄: {e}")
+                progress.progress((i + 1) / len(lines))
+            st.session_state["batch_results"] = results
+            if errors:
+                st.error("일부 실패:\n" + "\n".join(errors))
+            if results:
+                st.success(f"✅ {len(results)}개 생성 완료!")
+
+    if st.session_state.get("batch_results"):
+        st.divider()
+        st.subheader("🎧 결과")
+        results = st.session_state["batch_results"]
+        for i, r in enumerate(results):
+            st.caption(f"**{i+1}.** {r['text'][:60]}  ·  {SVC_LABELS.get(r['service'], r['service'])}")
+            st.audio(r["audio"], format="audio/mp3")
+
+        zbuf = io.BytesIO()
+        with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
+            for i, r in enumerate(results, 1):
+                z.writestr(f"{i:02d}.mp3", r["audio"])
+        st.download_button("⬇️ 전체 ZIP 다운로드", data=zbuf.getvalue(),
+                           file_name="batch_voices.zip", mime="application/zip",
+                           use_container_width=True, key="dl_zip")
+
+
+# ════════════════════════════════════════════════════════════
+# 섹션 4: 생성 기록
+# ════════════════════════════════════════════════════════════
+elif nav == NAV[3]:
     st.subheader("📝 생성 기록")
     history = load_history()
 
@@ -449,22 +465,20 @@ with main_tab3:
         st.info("아직 생성 기록이 없어요! 음성을 만들면 여기에 쌓여요 😊")
     else:
         if st.button("🗑️ 기록 전체 삭제"):
-            _save(HIST_FILE, [])
+            st.session_state["history"] = []
             st.rerun()
 
         for i, h in enumerate(history):
-            svc_label = {"elevenlabs": "🟢 ElevenLabs", "openai": "🔵 OpenAI", "gtts": "🟡 Google TTS"}.get(h["service"], h["service"])
+            svc_label = SVC_LABELS.get(h["service"], h["service"])
             with st.expander(f"**{h['time']}** | {h['voice']} | {svc_label} — {h['text']}"):
-                audio_bytes = bytes(h["audio"])
-
-                # 다시 듣기 & 다운로드
+                audio_bytes = h["audio"]
                 st.audio(audio_bytes, format="audio/mp3")
                 col_dl, col_reuse = st.columns(2)
                 col_dl.download_button("⬇️ 다운로드", data=audio_bytes,
                                        file_name=f"voice_{i+1}.mp3", mime="audio/mpeg",
-                                       key=f"dl_hist_{i}")
-
-                # 🔄 목소리 바꾸기 버튼
-                if col_reuse.button("🔄 목소리 바꿔서 재생성", key=f"reuse_{i}", use_container_width=True):
-                    st.session_state["reuse_text"] = h.get("full_text", h["text"])
-                    st.info("✅ 텍스트를 가져왔어요! '✍️ 텍스트로 생성' 탭으로 이동해서 목소리를 바꿔보세요!")
+                                       key=f"dl_hist_{i}", use_container_width=True)
+                if col_reuse.button("🔄 이 텍스트로 다시 만들기", key=f"reuse_{i}",
+                                    use_container_width=True):
+                    st.session_state["_pending_text"] = h.get("full_text", h["text"])
+                    st.session_state["_goto"] = NAV[0]     # '텍스트로 생성' 으로 자동 이동
+                    st.rerun()
