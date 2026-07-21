@@ -77,6 +77,17 @@ if "_pending_stt" in st.session_state:
 SVC_LABELS = {"elevenlabs": "🟢 ElevenLabs", "openai": "🔵 OpenAI", "gtts": "🟡 Google TTS"}
 LANGS = {"한국어": "ko", "English": "en", "日本語": "ja", "中文": "zh", "Español": "es", "Français": "fr"}
 
+# OpenAI 말투 프리셋 (gpt-4o-mini-tts instructions)
+OAI_TONE_PRESETS = {
+    "기본": "",
+    "다정하고 따뜻하게": "Speak in a warm, friendly, and caring tone, like talking to a close friend, with natural pauses.",
+    "차분한 내레이션": "Speak calmly and clearly like a professional audiobook narrator, with natural breathing and pauses.",
+    "밝고 활기차게": "Speak in a bright, upbeat, energetic and cheerful tone.",
+    "뉴스 앵커": "Speak in a clear, confident, neutral news-anchor tone.",
+    "감성적으로": "Speak slowly and emotionally, with expressive, heartfelt delivery.",
+    "속삭이듯 부드럽게": "Speak softly and gently, almost whispering, in an intimate tone.",
+}
+
 
 # ════════════════════════════════════════════════════════════
 # 목소리 목록 / 사용량 로드 (캐시)
@@ -279,6 +290,33 @@ def speed_pitch_widget(key_prefix: str):
     return speed, pitch
 
 
+def naturalness_widget(key_prefix: str, voice_id):
+    """선택한 목소리 엔진에 맞는 '자연스러움' 설정. (voice_settings, instructions) 반환."""
+    provider = voice_by_id.get(voice_id, {}).get("provider") if voice_id else None
+    voice_settings, instructions = None, None
+
+    with st.expander("🎭 자연스러움 설정 — 더 사람처럼"):
+        if provider == "elevenlabs":
+            st.caption("안정성을 낮추면 더 감정적이고 사람 같아요(대신 가끔 흔들려요). 표현력을 올리면 억양이 살아나요.")
+            stability = st.slider("안정성 (낮을수록 감정적)", 0.0, 1.0, 0.4, 0.05, key=f"stab_{key_prefix}")
+            style     = st.slider("표현력 / 감정", 0.0, 1.0, 0.2, 0.05, key=f"style_{key_prefix}")
+            similar   = st.slider("목소리 유사도", 0.0, 1.0, 0.75, 0.05, key=f"sim_{key_prefix}")
+            boost     = st.checkbox("스피커 부스트(또렷하게)", value=True, key=f"boost_{key_prefix}")
+            voice_settings = {"stability": stability, "style": style,
+                              "similarity_boost": similar, "use_speaker_boost": boost}
+        elif provider == "openai":
+            st.caption("말투를 지정하면 훨씬 자연스러워져요 (gpt-4o-mini-tts).")
+            preset = st.selectbox("말투 프리셋", list(OAI_TONE_PRESETS.keys()), key=f"tone_{key_prefix}")
+            custom = st.text_input("직접 지정 (선택)", key=f"tonec_{key_prefix}",
+                                   placeholder="예: 느리고 부드럽게, 조금 긴장한 듯")
+            instructions = custom.strip() or OAI_TONE_PRESETS[preset]
+        else:
+            st.caption("💡 Google TTS는 감정/말투 조절이 어려워요. 더 사람 같은 결과는 "
+                       "**ElevenLabs / OpenAI 목소리**를 골라주세요. "
+                       "'✨ 자연스럽게 다듬기'로 텍스트를 먼저 손보면 조금 나아져요.")
+    return voice_settings, instructions
+
+
 def result_player(audio: bytes, voice_name: str, service: str, file_name: str, dl_key: str):
     c1, c2 = st.columns([3, 1])
     c1.caption(f"목소리: **{voice_name}**")
@@ -304,11 +342,12 @@ if nav == NAV[0]:
     )
     st.caption(f"글자 수: {len(text_input)} / {MAX_CHARS}  ·  긴 글은 자동으로 나눠서 이어붙여요")
 
-    col_r, col_s, col_t = st.columns(3)
+    cols = st.columns(4)
     ai_actions = [
-        (col_r, "✏️ AI 교정", "refine", "맞춤법/문장 다듬기"),
-        (col_s, "📝 AI 요약", "summarize", "3문장 이내로 요약"),
-        (col_t, "🌏 한국어 번역", "translate_ko", "한국어로 번역"),
+        (cols[0], "✨ 자연스럽게", "naturalize", "구어체·쉼·숫자 풀어쓰기"),
+        (cols[1], "✏️ AI 교정", "refine", "맞춤법/문장 다듬기"),
+        (cols[2], "📝 AI 요약", "summarize", "3문장 이내로 요약"),
+        (cols[3], "🌏 한국어 번역", "translate_ko", "한국어로 번역"),
     ]
     for col, label, mode, help_txt in ai_actions:
         with col:
@@ -324,10 +363,11 @@ if nav == NAV[0]:
                     st.warning("⚠️ 먼저 텍스트를 입력해주세요!")
 
     st.divider()
-    st.subheader("3️⃣ 속도 / 피치 / 쉼")
+    st.subheader("3️⃣ 속도 / 피치 / 쉼 / 자연스러움")
     speed, pitch = speed_pitch_widget("t")
     pause_sec = st.slider("⏸️ 문단(빈 줄) 사이 쉼", 0.0, 2.0, 0.0, 0.1,
                           help="빈 줄로 나눈 문단 사이에 무음을 넣어요", key="pause_t")
+    vs_t, instr_t = naturalness_widget("t", v_id)
 
     st.divider()
     st.subheader("4️⃣ 음성 생성")
@@ -339,7 +379,8 @@ if nav == NAV[0]:
         else:
             with st.spinner("🎙️ 음성을 만들고 있어요..."):
                 try:
-                    audio, service = text_to_speech(text_input, v_id, pause_ms=int(pause_sec * 1000))
+                    audio, service = text_to_speech(text_input, v_id, pause_ms=int(pause_sec * 1000),
+                                                    voice_settings=vs_t, instructions=instr_t)
                     audio = adjust_audio(audio, speed=speed, pitch=pitch)
                     st.session_state.update({
                         "audio_data": audio, "audio_voice": v_name, "audio_service": service,
@@ -393,11 +434,12 @@ elif nav == NAV[1]:
                 st.download_button("💬 자막(SRT) 다운로드", data=st.session_state["stt_srt"],
                                    file_name="subtitle.srt", mime="text/plain", key="dl_srt")
 
-            col_r2, col_s2, col_t2 = st.columns(3)
+            cols2 = st.columns(4)
             stt_actions = [
-                (col_r2, "✏️ AI 교정", "refine"),
-                (col_s2, "📝 AI 요약", "summarize"),
-                (col_t2, "🌏 한국어 번역", "translate_ko"),
+                (cols2[0], "✨ 자연스럽게", "naturalize"),
+                (cols2[1], "✏️ AI 교정", "refine"),
+                (cols2[2], "📝 AI 요약", "summarize"),
+                (cols2[3], "🌏 한국어 번역", "translate_ko"),
             ]
             for col, label, mode in stt_actions:
                 with col:
@@ -417,8 +459,9 @@ elif nav == NAV[1]:
             v_id2, v_name2 = voice_selector_widget("mp3")
 
             st.divider()
-            st.subheader("🎚️ 속도 / 피치")
+            st.subheader("🎚️ 속도 / 피치 / 자연스러움")
             speed2, pitch2 = speed_pitch_widget("mp3")
+            vs_m, instr_m = naturalness_widget("mp3", v_id2)
 
             if st.button("🎵 새 목소리로 생성!", type="primary", use_container_width=True, key="gen_mp3"):
                 if not stt_text.strip():
@@ -428,7 +471,8 @@ elif nav == NAV[1]:
                 else:
                     with st.spinner("🎙️ 새 목소리로 생성 중..."):
                         try:
-                            audio, service = text_to_speech(stt_text, v_id2)
+                            audio, service = text_to_speech(stt_text, v_id2,
+                                                            voice_settings=vs_m, instructions=instr_m)
                             audio = adjust_audio(audio, speed=speed2, pitch=pitch2)
                             st.session_state.update({
                                 "mp3_audio": audio, "mp3_service": service, "mp3_voice": v_name2,
@@ -462,8 +506,9 @@ elif nav == NAV[2]:
     st.caption(f"입력된 문장: {len(lines)}개")
 
     st.divider()
-    st.subheader("3️⃣ 속도 / 피치")
+    st.subheader("3️⃣ 속도 / 피치 / 자연스러움")
     speed3, pitch3 = speed_pitch_widget("b")
+    vs_b, instr_b = naturalness_widget("b", vb_id)
 
     st.divider()
     if st.button("📦 일괄 생성 시작", type="primary", use_container_width=True, key="gen_batch"):
@@ -479,7 +524,8 @@ elif nav == NAV[2]:
             errors = []
             for i, line in enumerate(lines):
                 try:
-                    audio, service = text_to_speech(line, vb_id)
+                    audio, service = text_to_speech(line, vb_id,
+                                                    voice_settings=vs_b, instructions=instr_b)
                     audio = adjust_audio(audio, speed=speed3, pitch=pitch3)
                     results.append({"text": line, "audio": audio, "service": service})
                     add_history(vb_name, line, service, audio)

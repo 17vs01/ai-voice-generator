@@ -186,34 +186,39 @@ def get_elevenlabs_usage() -> dict | None:
 # ════════════════════════════════════════════════════════════
 # TTS 엔진별 함수
 # ════════════════════════════════════════════════════════════
-def _tts_elevenlabs(text: str, voice_id: str) -> bytes:
+def _tts_elevenlabs(text: str, voice_id: str, settings: dict | None = None) -> bytes:
     from elevenlabs import VoiceSettings
     client = _get_elevenlabs_client()
+    s = settings or {}
+    vs = VoiceSettings(
+        stability=s.get("stability", 0.4),            # 낮을수록 더 감정적/사람다움
+        similarity_boost=s.get("similarity_boost", 0.75),
+        style=s.get("style", 0.2),                    # 표현력(0~1)
+        use_speaker_boost=s.get("use_speaker_boost", True),
+    )
     gen = client.text_to_speech.convert(
         voice_id=voice_id,
         text=text,
         model_id="eleven_multilingual_v2",
-        voice_settings=VoiceSettings(stability=0.5, similarity_boost=0.75),
+        voice_settings=vs,
     )
     return b"".join(gen)
 
 
-def _tts_openai(text: str, voice_id: str) -> bytes:
-    """voice_id 예: oai_nova → nova"""
+def _tts_openai(text: str, voice_id: str, instructions: str | None = None) -> bytes:
+    """voice_id 예: oai_nova → nova. instructions 로 말투/감정 지정 가능(gpt-4o-mini-tts)."""
     real_voice = voice_id.replace("oai_", "")
     client = _get_openai_client()
+    kwargs = {"model": OPENAI_MODEL, "voice": real_voice, "input": text}
+    if instructions:
+        kwargs["instructions"] = instructions
     try:
-        response = client.audio.speech.create(
-            model=OPENAI_MODEL,
-            voice=real_voice,
-            input=text,
-        )
-        return response.content
+        return client.audio.speech.create(**kwargs).content
     except Exception as e:
         # 최신 모델이 계정에서 안 되면, 구형 6종은 tts-1 로 안전하게 재시도
+        # (tts-1 은 instructions 미지원이라 말투 지시는 빠져요)
         if not _is_quota_error(e) and real_voice in _OPENAI_ORIGINAL:
-            response = client.audio.speech.create(model="tts-1", voice=real_voice, input=text)
-            return response.content
+            return client.audio.speech.create(model="tts-1", voice=real_voice, input=text).content
         raise
 
 
@@ -297,7 +302,9 @@ def _is_quota_error(e: Exception) -> bool:
     return any(k in err for k in ("quota", "limit", "429", "402", "credit", "insufficient"))
 
 
-def _synth_one(text: str, voice_id: str) -> tuple[bytes, str]:
+def _synth_one(text: str, voice_id: str,
+               voice_settings: dict | None = None,
+               instructions: str | None = None) -> tuple[bytes, str]:
     """단일 덩어리를 음성으로 변환. (bytes, service) 반환. 한도 초과 시 gTTS 로 폴백."""
     # ── gTTS 목소리 ──
     if voice_id.startswith("gtts_"):
@@ -307,7 +314,7 @@ def _synth_one(text: str, voice_id: str) -> tuple[bytes, str]:
     # ── OpenAI 목소리 (한도 초과 시 gTTS 폴백) ──
     if voice_id.startswith("oai_"):
         try:
-            return _tts_openai(text, voice_id), "openai"
+            return _tts_openai(text, voice_id, instructions), "openai"
         except Exception as e:
             if _is_quota_error(e):
                 return _tts_gtts(text, _detect_lang(text)), "gtts"
@@ -315,7 +322,7 @@ def _synth_one(text: str, voice_id: str) -> tuple[bytes, str]:
 
     # ── ElevenLabs (한도 초과 시 gTTS 폴백) ──
     try:
-        return _tts_elevenlabs(text, voice_id), "elevenlabs"
+        return _tts_elevenlabs(text, voice_id, voice_settings), "elevenlabs"
     except Exception as e:
         if _is_quota_error(e):
             try:
@@ -325,29 +332,35 @@ def _synth_one(text: str, voice_id: str) -> tuple[bytes, str]:
         raise RuntimeError(f"❌ 음성 생성 실패: {e}")
 
 
-def _synth_engine(text: str, voice_id: str) -> tuple[bytes, str]:
+def _synth_engine(text: str, voice_id: str,
+                  voice_settings: dict | None = None,
+                  instructions: str | None = None) -> tuple[bytes, str]:
     """긴 텍스트는 자동 분할해서 합쳐요."""
     chunks = _split_into_chunks(text)
     if len(chunks) == 1:
-        return _synth_one(chunks[0], voice_id)
+        return _synth_one(chunks[0], voice_id, voice_settings, instructions)
 
     parts: list[bytes] = []
     service = None
     for c in chunks:
-        b, s = _synth_one(c, voice_id)
+        b, s = _synth_one(c, voice_id, voice_settings, instructions)
         parts.append(b)
         service = "gtts" if (service == "gtts" or s == "gtts") else s
     return _concat_audios(parts, 0), service or "unknown"
 
 
-def text_to_speech(text: str, voice_id: str, pause_ms: int = 0) -> tuple[bytes, str]:
+def text_to_speech(text: str, voice_id: str, pause_ms: int = 0,
+                   voice_settings: dict | None = None,
+                   instructions: str | None = None) -> tuple[bytes, str]:
     """
     텍스트를 음성으로 변환해요.
 
     Args:
-        text     : 읽어줄 텍스트 (자동으로 긴 텍스트는 분할)
-        voice_id : 목소리 ID
-        pause_ms : 문단(빈 줄) 사이에 넣을 무음 길이(ms). 0이면 붙여서 생성.
+        text           : 읽어줄 텍스트 (자동으로 긴 텍스트는 분할)
+        voice_id       : 목소리 ID
+        pause_ms       : 문단(빈 줄) 사이에 넣을 무음 길이(ms). 0이면 붙여서 생성.
+        voice_settings : ElevenLabs 감정 설정 {stability, style, similarity_boost, use_speaker_boost}
+        instructions   : OpenAI 말투/감정 지시문 (gpt-4o-mini-tts)
 
     Returns:
         (MP3 bytes, 사용된 서비스명)
@@ -366,7 +379,7 @@ def text_to_speech(text: str, voice_id: str, pause_ms: int = 0) -> tuple[bytes, 
     parts: list[bytes] = []
     service = None
     for p in paragraphs:
-        b, s = _synth_engine(p, voice_id)
+        b, s = _synth_engine(p, voice_id, voice_settings, instructions)
         parts.append(b)
         service = "gtts" if (service == "gtts" or s == "gtts") else s
 
@@ -531,6 +544,13 @@ def refine_text_with_ai(text: str, mode: str = "summarize") -> str:
         "summarize":    f"다음 텍스트를 3문장 이내로 핵심만 요약해줘. 결과만 출력해:\n\n{text}",
         "refine":       f"다음 텍스트의 맞춤법과 문장을 자연스럽게 다듬어줘. 결과만 출력해:\n\n{text}",
         "translate_ko": f"다음 텍스트를 자연스러운 한국어로 번역해줘. 결과만 출력해:\n\n{text}",
+        "naturalize":   (
+            "다음 텍스트를 사람이 실제로 말하듯 자연스럽게 다듬어줘. "
+            "딱딱한 문어체는 구어체로 바꾸고, 너무 긴 문장은 짧게 나누고, "
+            "자연스러운 호흡을 위해 쉼표·마침표를 알맞게 넣어줘. "
+            "숫자·기호·약어는 소리 내어 읽는 방식대로 풀어써줘(예: 3kg → 삼 킬로그램). "
+            "의미는 그대로 두고, 다듬은 텍스트만 출력해:\n\n" + text
+        ),
     }
     prompt = prompts.get(mode, prompts["refine"])
 
