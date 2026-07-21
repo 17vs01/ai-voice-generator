@@ -17,6 +17,7 @@ from tts_service import (
     refine_text_with_ai,
     adjust_audio,
     get_elevenlabs_usage,
+    health_check,
     MAX_CHARS,
 )
 
@@ -136,6 +137,21 @@ with st.sidebar:
         st.caption(f"{used:,} / {limit:,} 자 ({limit - used:,}자 남음)")
 
     st.divider()
+    st.subheader("🩺 엔진 상태 점검")
+    if st.button("지금 점검하기", use_container_width=True):
+        with st.spinner("각 엔진을 확인하고 있어요..."):
+            st.session_state["health"] = health_check()
+    health = st.session_state.get("health")
+    if health:
+        icon = {True: "🟢", False: "⚠️", None: "⚪"}
+        names = {"elevenlabs": "ElevenLabs", "openai": "OpenAI", "gtts": "Google TTS"}
+        for prov in ("elevenlabs", "openai", "gtts"):
+            info = health.get(prov, {})
+            st.caption(f"{icon.get(info.get('ok'), '⚪')} **{names[prov]}** — {info.get('msg', '')}")
+    else:
+        st.caption("버튼을 누르면 각 엔진을 실제로 테스트해요.")
+
+    st.divider()
     st.caption("AI 음성 생성기 v4.0")
 
 
@@ -154,12 +170,43 @@ st.divider()
 # 공통: 목소리 선택 위젯 (라디오 필터 + 단일 셀렉트박스 + 미리듣기)
 #   → 화면에 보이는 선택이 곧 실제 선택 (탭 방식의 오작동 해결)
 # ════════════════════════════════════════════════════════════
+_PREVIEW_SAMPLES = {
+    "gtts_en":    "Hello! This is a quick voice preview.",
+    "gtts_ja":    "こんにちは。これは声のプレビューです。",
+    "gtts_zh-CN": "你好，这是一个语音预览。",
+    "gtts_es":    "Hola, esta es una vista previa de la voz.",
+    "gtts_fr":    "Bonjour, ceci est un aperçu de la voix.",
+    "gtts_de":    "Hallo, das ist eine kurze Sprachvorschau.",
+}
+
 def _preview_text(voice_id: str) -> str:
-    if voice_id == "gtts_en":
-        return "Hello! This is a quick voice preview."
-    if voice_id == "gtts_ja":
-        return "こんにちは。これは声のプレビューです。"
-    return "안녕하세요, 만나서 반가워요. 목소리 미리듣기입니다."
+    return _PREVIEW_SAMPLES.get(voice_id, "안녕하세요, 만나서 반가워요. 목소리 미리듣기입니다.")
+
+def _make_preview(voice_id: str) -> None:
+    """해당 목소리의 미리듣기 오디오를 생성해 세션에 캐시해요 (이미 있으면 건너뜀)."""
+    cache = st.session_state.setdefault("preview_audio", {})
+    if voice_id in cache:
+        return
+    with st.spinner("미리듣기 생성 중..."):
+        try:
+            audio, _ = text_to_speech(_preview_text(voice_id), voice_id)
+            cache[voice_id] = audio
+        except Exception as e:
+            st.error(str(e))
+
+def _voice_health_note(voice_id: str):
+    """헬스체크를 돌렸다면, 선택한 목소리의 엔진 상태를 한 줄로 보여줘요."""
+    provider = voice_by_id.get(voice_id, {}).get("provider")
+    health = st.session_state.get("health")
+    if not health or not provider:
+        return
+    info = health.get(provider)
+    if not info:
+        return
+    if info["ok"] is True:
+        st.caption(f"🟢 엔진 상태: {info['msg']}")
+    elif info["ok"] is False:
+        st.caption(f"⚠️ 엔진 상태: {info['msg']}")
 
 def voice_selector_widget(key_prefix: str):
     """(voice_id, display_name) 반환. 하나만 선택되므로 결과가 명확해요."""
@@ -182,10 +229,25 @@ def voice_selector_widget(key_prefix: str):
         st.info("해당하는 목소리가 없어요. 다른 탭에서 ☆ 버튼으로 즐겨찾기를 추가해보세요.")
         return None, None
 
+    # ── 목소리 둘러보기: 여러 목소리를 눌러가며 미리듣고 고르기 ──
+    with st.expander(f"🎧 목소리 둘러보기 — 눌러서 미리듣기 ({len(pool)}개)"):
+        shown = pool[:30]
+        for v in shown:
+            row = st.columns([5, 1])
+            row[0].write(v["display_name"])
+            if row[1].button("🔊", key=f"bp_{key_prefix}_{v['voice_id']}"):
+                _make_preview(v["voice_id"])
+            bp = st.session_state.get("preview_audio", {}).get(v["voice_id"])
+            if bp:
+                st.audio(bp, format="audio/mp3")
+        if len(pool) > 30:
+            st.caption(f"…외 {len(pool) - 30}개. 필터(여성/남성/즐겨찾기)로 좁혀보세요.")
+
     opts = {v["display_name"]: v for v in pool}
-    picked_name = st.selectbox("목소리를 골라주세요", list(opts.keys()), key=f"sel_{key_prefix}")
+    picked_name = st.selectbox("✅ 사용할 목소리", list(opts.keys()), key=f"sel_{key_prefix}")
     picked = opts[picked_name]
     vid = picked["voice_id"]
+    _voice_health_note(vid)
 
     c1, c2 = st.columns(2)
     is_fav = vid in load_favorites()
@@ -194,14 +256,7 @@ def voice_selector_widget(key_prefix: str):
         toggle_favorite(vid)
         st.rerun()
     if c2.button("🔊 미리듣기", key=f"prev_{key_prefix}", use_container_width=True):
-        cache = st.session_state.setdefault("preview_audio", {})
-        if vid not in cache:
-            with st.spinner("미리듣기 생성 중..."):
-                try:
-                    audio, _ = text_to_speech(_preview_text(vid), vid)
-                    cache[vid] = audio
-                except Exception as e:
-                    st.error(str(e))
+        _make_preview(vid)
 
     pv = st.session_state.get("preview_audio", {}).get(vid)
     if pv:

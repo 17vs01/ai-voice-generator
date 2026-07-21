@@ -23,21 +23,32 @@ load_dotenv()
 # ── 성별 아이콘 ───────────────────────────────────────────────
 GENDER_ICON = {"male": "👨", "female": "👩"}
 
-# ── OpenAI 기본 목소리 목록 ───────────────────────────────────
+# ── OpenAI 목소리 목록 (gpt-4o-mini-tts 지원 11종) ────────────
+OPENAI_MODEL = "gpt-4o-mini-tts"          # 최신 TTS 모델 (구형 6종 + 신규 5종 지원)
+_OPENAI_ORIGINAL = {"alloy", "echo", "fable", "onyx", "nova", "shimmer"}  # tts-1 로도 되는 것들
 OPENAI_VOICES = [
     {"voice_id": "oai_alloy",   "name": "Alloy",   "gender": "female"},
+    {"voice_id": "oai_ash",     "name": "Ash",     "gender": "male"},
+    {"voice_id": "oai_ballad",  "name": "Ballad",  "gender": "male"},
+    {"voice_id": "oai_coral",   "name": "Coral",   "gender": "female"},
     {"voice_id": "oai_echo",    "name": "Echo",    "gender": "male"},
     {"voice_id": "oai_fable",   "name": "Fable",   "gender": "male"},
-    {"voice_id": "oai_onyx",    "name": "Onyx",    "gender": "male"},
     {"voice_id": "oai_nova",    "name": "Nova",    "gender": "female"},
+    {"voice_id": "oai_onyx",    "name": "Onyx",    "gender": "male"},
+    {"voice_id": "oai_sage",    "name": "Sage",    "gender": "female"},
     {"voice_id": "oai_shimmer", "name": "Shimmer", "gender": "female"},
+    {"voice_id": "oai_verse",   "name": "Verse",   "gender": "male"},
 ]
 
 # ── gTTS 목소리(언어) 목록 → API 키가 하나도 없어도 항상 사용 가능 ──
 GTTS_VOICES = [
-    {"voice_id": "gtts_ko", "name": "Google 한국어"},
-    {"voice_id": "gtts_en", "name": "Google English"},
-    {"voice_id": "gtts_ja", "name": "Google 日本語"},
+    {"voice_id": "gtts_ko",    "name": "Google 한국어"},
+    {"voice_id": "gtts_en",    "name": "Google English"},
+    {"voice_id": "gtts_ja",    "name": "Google 日本語"},
+    {"voice_id": "gtts_zh-CN", "name": "Google 中文"},
+    {"voice_id": "gtts_es",    "name": "Google Español"},
+    {"voice_id": "gtts_fr",    "name": "Google Français"},
+    {"voice_id": "gtts_de",    "name": "Google Deutsch"},
 ]
 
 # 텍스트 제한 / 분할 기준
@@ -191,12 +202,19 @@ def _tts_openai(text: str, voice_id: str) -> bytes:
     """voice_id 예: oai_nova → nova"""
     real_voice = voice_id.replace("oai_", "")
     client = _get_openai_client()
-    response = client.audio.speech.create(
-        model="tts-1",
-        voice=real_voice,
-        input=text,
-    )
-    return response.content
+    try:
+        response = client.audio.speech.create(
+            model=OPENAI_MODEL,
+            voice=real_voice,
+            input=text,
+        )
+        return response.content
+    except Exception as e:
+        # 최신 모델이 계정에서 안 되면, 구형 6종은 tts-1 로 안전하게 재시도
+        if not _is_quota_error(e) and real_voice in _OPENAI_ORIGINAL:
+            response = client.audio.speech.create(model="tts-1", voice=real_voice, input=text)
+            return response.content
+        raise
 
 
 def _tts_gtts(text: str, lang: str = "ko") -> bytes:
@@ -526,3 +544,56 @@ def refine_text_with_ai(text: str, mode: str = "summarize") -> str:
         return response.choices[0].message.content.strip()
     except Exception as e:
         raise RuntimeError(f"❌ AI 텍스트 다듬기 실패: {e}")
+
+
+# ════════════════════════════════════════════════════════════
+# 엔진 상태 점검 (헬스체크)
+# ════════════════════════════════════════════════════════════
+def health_check() -> dict:
+    """
+    각 엔진을 실제로 살짝 호출해서 작동 여부를 확인해요.
+    반환: {"gtts": {"ok": bool|None, "msg": str}, "openai": {...}, "elevenlabs": {...}}
+      ok = True  → 정상
+      ok = False → 문제 있음(메시지 참고, 대부분 한도 초과 → Google TTS 대체)
+      ok = None  → 키 없음(목록에 아예 표시되지 않음)
+    한 엔진의 모든 목소리는 상태를 공유해요(같은 API를 쓰므로).
+    """
+    results: dict = {}
+
+    # ── Google TTS (키 불필요, 항상 테스트) ──
+    try:
+        _tts_gtts("테스트", "ko")
+        results["gtts"] = {"ok": True, "msg": "정상 (키 불필요)"}
+    except Exception as e:
+        results["gtts"] = {"ok": False, "msg": str(e)[:100]}
+
+    # ── OpenAI (짧은 문장으로 실제 테스트) ──
+    if has_openai():
+        try:
+            _tts_openai("hi", "oai_alloy")
+            results["openai"] = {"ok": True, "msg": f"정상 (모델: {OPENAI_MODEL})"}
+        except Exception as e:
+            if _is_quota_error(e):
+                results["openai"] = {"ok": False, "msg": "한도 초과 → Google TTS로 자동 대체"}
+            else:
+                results["openai"] = {"ok": False, "msg": str(e)[:100]}
+    else:
+        results["openai"] = {"ok": None, "msg": "키 없음 (목록에 표시 안 됨)"}
+
+    # ── ElevenLabs (크레딧은 사용량으로 확인, 불필요한 소모 방지) ──
+    if has_elevenlabs():
+        usage = get_elevenlabs_usage()
+        if usage and usage.get("limit") and usage["used"] >= usage["limit"]:
+            results["elevenlabs"] = {
+                "ok": False,
+                "msg": f"한도 초과 ({usage['used']:,}/{usage['limit']:,}자) → Google TTS로 대체",
+            }
+        else:
+            remain = ""
+            if usage and usage.get("limit"):
+                remain = f" ({usage['limit'] - usage['used']:,}자 남음)"
+            results["elevenlabs"] = {"ok": True, "msg": f"정상{remain}"}
+    else:
+        results["elevenlabs"] = {"ok": None, "msg": "키 없음 (목록에 표시 안 됨)"}
+
+    return results
