@@ -40,6 +40,16 @@ OPENAI_VOICES = [
     {"voice_id": "oai_verse",   "name": "Verse",   "gender": "male"},
 ]
 
+# ── ElevenLabs 모델 목록 ──────────────────────────────────────
+ELEVEN_DEFAULT_MODEL = "eleven_multilingual_v2"   # 폴백용 안정 모델
+ELEVEN_MODELS = {
+    "eleven_v3":              "v3 — 가장 표현력·감정 (최신, 계정 권한 필요할 수 있음)",
+    "eleven_multilingual_v2": "Multilingual v2 — 고품질 안정 (권장)",
+    "eleven_turbo_v2_5":      "Turbo v2.5 — 빠름·저지연",
+    "eleven_flash_v2_5":      "Flash v2.5 — 가장 빠름",
+}
+_EL_UNAVAILABLE: set = set()   # 이 프로세스에서 접근 불가로 확인된 모델(반복 재시도 방지)
+
 # ── gTTS 목소리(언어) 목록 → API 키가 하나도 없어도 항상 사용 가능 ──
 GTTS_VOICES = [
     {"voice_id": "gtts_ko",    "name": "Google 한국어"},
@@ -196,13 +206,25 @@ def _tts_elevenlabs(text: str, voice_id: str, settings: dict | None = None) -> b
         style=s.get("style", 0.2),                    # 표현력(0~1)
         use_speaker_boost=s.get("use_speaker_boost", True),
     )
-    gen = client.text_to_speech.convert(
-        voice_id=voice_id,
-        text=text,
-        model_id="eleven_multilingual_v2",
-        voice_settings=vs,
-    )
-    return b"".join(gen)
+
+    model_id = s.get("model_id") or ELEVEN_DEFAULT_MODEL
+    if model_id in _EL_UNAVAILABLE:                   # 이미 안 되는 걸로 확인된 모델은 건너뜀
+        model_id = ELEVEN_DEFAULT_MODEL
+
+    def _convert(mid: str) -> bytes:
+        gen = client.text_to_speech.convert(
+            voice_id=voice_id, text=text, model_id=mid, voice_settings=vs,
+        )
+        return b"".join(gen)
+
+    try:
+        return _convert(model_id)
+    except Exception as e:
+        # 모델 접근 불가/미지원이면 안정 모델로 1회 폴백 (한도 초과는 상위에서 gTTS 로 처리)
+        if model_id != ELEVEN_DEFAULT_MODEL and not _is_quota_error(e):
+            _EL_UNAVAILABLE.add(model_id)
+            return _convert(ELEVEN_DEFAULT_MODEL)
+        raise
 
 
 def _tts_openai(text: str, voice_id: str, instructions: str | None = None) -> bytes:

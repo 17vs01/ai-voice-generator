@@ -18,6 +18,7 @@ from tts_service import (
     adjust_audio,
     get_elevenlabs_usage,
     health_check,
+    ELEVEN_MODELS,
     MAX_CHARS,
 )
 
@@ -126,6 +127,12 @@ with st.sidebar:
                 st.rerun()
     else:
         st.caption("아직 즐겨찾기가 없어요!\n목소리 아래 ☆ 버튼을 눌러보세요.")
+
+    st.divider()
+    st.subheader("🧬 ElevenLabs 모델")
+    el_model = st.selectbox("모델 선택", list(ELEVEN_MODELS.keys()),
+                            format_func=lambda m: ELEVEN_MODELS[m], key="el_model")
+    st.caption("v3가 가장 자연스러워요. 계정에서 안 되면 자동으로 v2로 대체됩니다.")
 
     st.divider()
     st.subheader("🌐 언어")
@@ -303,7 +310,9 @@ def naturalness_widget(key_prefix: str, voice_id):
             similar   = st.slider("목소리 유사도", 0.0, 1.0, 0.75, 0.05, key=f"sim_{key_prefix}")
             boost     = st.checkbox("스피커 부스트(또렷하게)", value=True, key=f"boost_{key_prefix}")
             voice_settings = {"stability": stability, "style": style,
-                              "similarity_boost": similar, "use_speaker_boost": boost}
+                              "similarity_boost": similar, "use_speaker_boost": boost,
+                              "model_id": st.session_state.get("el_model")}
+            st.caption(f"모델: **{st.session_state.get('el_model', '기본')}** (사이드바에서 변경)")
         elif provider == "openai":
             st.caption("말투를 지정하면 훨씬 자연스러워져요 (gpt-4o-mini-tts).")
             preset = st.selectbox("말투 프리셋", list(OAI_TONE_PRESETS.keys()), key=f"tone_{key_prefix}")
