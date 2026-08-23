@@ -1,5 +1,6 @@
 # API 키 절대 올리면 안 돼요!
 .env
+.streamlit/secrets.toml
 
 # 생성된 파일들
 favorites.json
