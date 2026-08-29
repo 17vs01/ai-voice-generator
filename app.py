@@ -75,7 +75,7 @@ if "_pending_stt" in st.session_state:
     st.session_state["stt_key"] = st.session_state.pop("_pending_stt")
 
 
-SVC_LABELS = {"elevenlabs": "🟢 ElevenLabs", "openai": "🔵 OpenAI", "gtts": "🟡 Google TTS"}
+SVC_LABELS = {"elevenlabs": "🟢 ElevenLabs", "openai": "🔵 OpenAI", "azure": "💠 Azure", "gtts": "🟡 Google TTS"}
 LANGS = {"한국어": "ko", "English": "en", "日本語": "ja", "中文": "zh", "Español": "es", "Français": "fr"}
 
 # OpenAI 말투 프리셋 (gpt-4o-mini-tts instructions)
@@ -162,8 +162,8 @@ with st.sidebar:
     health = st.session_state.get("health")
     if health:
         icon = {True: "🟢", False: "⚠️", None: "⚪"}
-        names = {"elevenlabs": "ElevenLabs", "openai": "OpenAI", "gtts": "Google TTS"}
-        for prov in ("elevenlabs", "openai", "gtts"):
+        names = {"elevenlabs": "ElevenLabs", "openai": "OpenAI", "azure": "Azure", "gtts": "Google TTS"}
+        for prov in ("elevenlabs", "openai", "azure", "gtts"):
             info = health.get(prov, {})
             st.caption(f"{icon.get(info.get('ok'), '⚪')} **{names[prov]}** — {info.get('msg', '')}")
     else:

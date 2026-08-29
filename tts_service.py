@@ -50,6 +50,25 @@ ELEVEN_MODELS = {
 }
 _EL_UNAVAILABLE: set = set()   # 이 프로세스에서 접근 불가로 확인된 모델(반복 재시도 방지)
 
+# ── Azure Speech 목소리 목록 ──────────────────────────────────
+# HD(DragonHD) = LLM 기반, 문맥을 읽고 감정을 '자동으로' 연기 (태그 불필요).
+# 다국어 HD/Multilingual은 한국어 입력도 그 음색으로 읽어요.
+# ※ HD는 일부 리전 전용(southeastasia/eastus 등) — koreacentral 키면 표준만 써요.
+AZURE_VOICES = [
+    # HD (감정 자동 연기)
+    {"voice_id": "az_en-US-Ava:DragonHDLatestNeural",    "name": "Ava HD (감정연기)",    "gender": "female", "hd": True},
+    {"voice_id": "az_en-US-Emma:DragonHDLatestNeural",   "name": "Emma HD (감정연기)",   "gender": "female", "hd": True},
+    {"voice_id": "az_en-US-Andrew:DragonHDLatestNeural", "name": "Andrew HD (감정연기)", "gender": "male",   "hd": True},
+    {"voice_id": "az_en-US-Brian:DragonHDLatestNeural",  "name": "Brian HD (감정연기)",  "gender": "male",   "hd": True},
+    # 한국어 표준 뉴럴
+    {"voice_id": "az_ko-KR-SunHiNeural",              "name": "선히 (Azure)", "gender": "female", "hd": False},
+    {"voice_id": "az_ko-KR-InJoonNeural",             "name": "인준 (Azure)", "gender": "male",   "hd": False},
+    {"voice_id": "az_ko-KR-HyunsuMultilingualNeural", "name": "현수 (Azure)", "gender": "male",   "hd": False},
+    # 영어 음색 다국어 (표준)
+    {"voice_id": "az_en-US-AvaMultilingualNeural",    "name": "Ava (다국어)",    "gender": "female", "hd": False},
+    {"voice_id": "az_en-US-AndrewMultilingualNeural", "name": "Andrew (다국어)", "gender": "male",   "hd": False},
+]
+
 # ── gTTS 목소리(언어) 목록 → API 키가 하나도 없어도 항상 사용 가능 ──
 GTTS_VOICES = [
     {"voice_id": "gtts_ko",    "name": "Google 한국어"},
@@ -98,6 +117,14 @@ def has_openai() -> bool:
     return _has_key("OPENAI_API_KEY", "your_openai_api_key_here")
 
 
+def has_azure() -> bool:
+    return _has_key("AZURE_SPEECH_KEY", "your_azure_speech_key_here")
+
+
+def _azure_region() -> str:
+    return os.getenv("AZURE_SPEECH_REGION", "").strip() or "southeastasia"
+
+
 # ════════════════════════════════════════════════════════════
 # 목소리 목록
 # ════════════════════════════════════════════════════════════
@@ -143,6 +170,20 @@ def get_voices() -> list[dict]:
                 "gender_icon":  icon,
                 "display_name": f"{icon} {v['name']} [OpenAI]",
                 "provider":     "openai",
+            })
+
+    # ── Azure 목소리 (책읽기 앱과 같은 키 공유 — 무료 월 50만 자) ──
+    if has_azure():
+        for v in AZURE_VOICES:
+            icon = "🎭" if v["hd"] else GENDER_ICON.get(v["gender"], "🎙️")
+            voices.append({
+                "voice_id":     v["voice_id"],
+                "name":         v["name"],
+                "category":     "Azure HD" if v["hd"] else "Azure",
+                "gender":       v["gender"],
+                "gender_icon":  icon,
+                "display_name": f"{icon} {v['name']} [Azure]",
+                "provider":     "azure",
             })
 
     # ── gTTS 목소리 (항상 추가) ──
@@ -252,6 +293,49 @@ def _tts_gtts(text: str, lang: str = "ko") -> bytes:
     return buf.read()
 
 
+def _tts_azure(text: str, voice_id: str) -> bytes:
+    """voice_id 예: az_ko-KR-SunHiNeural → ko-KR-SunHiNeural.
+    Azure 공식 REST — HD 음성은 문맥 기반으로 감정을 자동 연기해요."""
+    import requests
+
+    voice = voice_id.removeprefix("az_")
+    key = os.getenv("AZURE_SPEECH_KEY", "")
+    region = _azure_region()
+
+    # SSML의 xml:lang 은 음성 이름 앞부분(ko-KR / en-US)에서 추출
+    parts = voice.split("-")
+    lang = f"{parts[0]}-{parts[1]}" if len(parts) >= 2 else "ko-KR"
+
+    esc = (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+               .replace("'", "&apos;").replace('"', "&quot;"))
+    ssml = (f"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' "
+            f"xml:lang='{lang}'><voice name='{voice}'>{esc}</voice></speak>")
+
+    resp = requests.post(
+        f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1",
+        headers={
+            "Ocp-Apim-Subscription-Key": key,
+            "Content-Type": "application/ssml+xml",
+            "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+            "User-Agent": "ai-voice-generator",
+        },
+        data=ssml.encode("utf-8"),
+        timeout=30,
+    )
+    if resp.status_code == 200:
+        if len(resp.content) < 64:
+            raise RuntimeError("Azure 응답이 비어있어요 (음성 이름 확인)")
+        return resp.content
+    if resp.status_code in (401, 403):
+        raise RuntimeError(f"Azure 키/리전 오류 ({resp.status_code}) — .env 확인")
+    if resp.status_code == 429:
+        raise RuntimeError("Azure 429: 무료 한도 초과 또는 요청 제한")
+    if resp.status_code == 400:
+        raise RuntimeError(
+            f"Azure 400: '{voice}' 음성이 {region} 리전에 없어요 (HD는 일부 리전 전용)")
+    raise RuntimeError(f"Azure 합성 실패 HTTP {resp.status_code}: {resp.text[:150]}")
+
+
 # ════════════════════════════════════════════════════════════
 # 언어 감지 / 텍스트 분할 / 오디오 이어붙이기
 # ════════════════════════════════════════════════════════════
@@ -332,6 +416,15 @@ def _synth_one(text: str, voice_id: str,
     if voice_id.startswith("gtts_"):
         lang = voice_id.split("_", 1)[1] or "ko"
         return _tts_gtts(text, lang), "gtts"
+
+    # ── Azure 목소리 (한도 초과 시 gTTS 폴백) ──
+    if voice_id.startswith("az_"):
+        try:
+            return _tts_azure(text, voice_id), "azure"
+        except Exception as e:
+            if _is_quota_error(e):
+                return _tts_gtts(text, _detect_lang(text)), "gtts"
+            raise RuntimeError(f"❌ Azure TTS 실패: {e}")
 
     # ── OpenAI 목소리 (한도 초과 시 gTTS 폴백) ──
     if voice_id.startswith("oai_"):
@@ -621,6 +714,29 @@ def health_check() -> dict:
                 results["openai"] = {"ok": False, "msg": str(e)[:100]}
     else:
         results["openai"] = {"ok": None, "msg": "키 없음 (목록에 표시 안 됨)"}
+
+    # ── Azure (음성목록 API로 키 검증 — 무료 글자수 소모 없음) ──
+    if has_azure():
+        try:
+            import requests
+            region = _azure_region()
+            r = requests.get(
+                f"https://{region}.tts.speech.microsoft.com/cognitiveservices/voices/list",
+                headers={"Ocp-Apim-Subscription-Key": os.getenv("AZURE_SPEECH_KEY", "")},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                n_hd = sum(1 for v in r.json() if ":DragonHD" in v.get("ShortName", ""))
+                hd_note = f", HD {n_hd}종 사용 가능" if n_hd else ", HD 없음(리전 확인)"
+                results["azure"] = {"ok": True, "msg": f"정상 ({region}{hd_note})"}
+            elif r.status_code in (401, 403):
+                results["azure"] = {"ok": False, "msg": f"키/리전 오류 ({r.status_code}) — .env 확인"}
+            else:
+                results["azure"] = {"ok": False, "msg": f"HTTP {r.status_code}"}
+        except Exception as e:
+            results["azure"] = {"ok": False, "msg": str(e)[:100]}
+    else:
+        results["azure"] = {"ok": None, "msg": "키 없음 (목록에 표시 안 됨)"}
 
     # ── ElevenLabs (크레딧은 사용량으로 확인, 불필요한 소모 방지) ──
     if has_elevenlabs():
