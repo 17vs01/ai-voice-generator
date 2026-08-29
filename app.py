@@ -6,6 +6,7 @@ app.py  –  AI 음성 생성기 v4.0
 """
 
 import io
+import os
 import zipfile
 from datetime import datetime
 
@@ -32,6 +33,55 @@ st.markdown("""
     section[data-testid="stSidebar"] * { color: white !important; }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ════════════════════════════════════════════════════════════
+# 배포용 ①: Streamlit Cloud의 Secrets → 환경변수로 연결
+#   로컬은 .env, 클라우드는 Secrets 를 쓰도록 둘 다 지원해요.
+#   (Streamlit Cloud → App settings → Secrets 에 아래처럼 넣으세요)
+#     ELEVENLABS_API_KEY = "sk_..."
+#     OPENAI_API_KEY     = "sk-..."
+#     APP_PASSWORD       = "원하는_비밀번호"   ← 공개 배포 시 크레딧 보호용(선택)
+# ════════════════════════════════════════════════════════════
+def _bridge_secrets() -> None:
+    try:
+        secrets = st.secrets
+    except Exception:
+        return  # secrets.toml 이 없으면(로컬 등) 그냥 넘어감
+    for key in ("ELEVENLABS_API_KEY", "OPENAI_API_KEY", "APP_PASSWORD"):
+        try:
+            val = secrets[key] if key in secrets else None
+        except Exception:
+            val = None
+        if val:
+            os.environ.setdefault(key, str(val))  # .env 값이 있으면 그걸 우선
+
+_bridge_secrets()
+
+
+# ════════════════════════════════════════════════════════════
+# 배포용 ②: 간단한 비밀번호 잠금
+#   APP_PASSWORD 가 설정돼 있을 때만 작동해요(로컬은 잠기지 않음).
+#   공개 URL로 배포할 때 아무나 내 API 크레딧을 쓰지 못하게 막아줘요.
+# ════════════════════════════════════════════════════════════
+def _check_password() -> None:
+    expected = os.getenv("APP_PASSWORD")
+    if not expected:
+        return                       # 비밀번호 미설정 → 잠금 없음
+    if st.session_state.get("_authed"):
+        return                       # 이미 인증됨
+    st.title("🔒 AI 음성 생성기")
+    st.caption("이 앱은 비밀번호로 보호돼 있어요.")
+    pw = st.text_input("비밀번호", type="password")
+    if pw:
+        if pw == expected:
+            st.session_state["_authed"] = True
+            st.rerun()
+        else:
+            st.error("비밀번호가 틀렸어요. 다시 시도해주세요.")
+    st.stop()
+
+_check_password()
 
 
 # ════════════════════════════════════════════════════════════
